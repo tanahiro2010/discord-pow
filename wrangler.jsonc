@@ -15,6 +15,14 @@
 			"name": "discord-pow-v2",
 			"vars": {
 				"POW_COMMAND_NAME": "pow2"
+			},
+			"durable_objects": {
+				"bindings": [
+					{
+						"name": "NONCE_STORE",
+						"class_name": "NonceStore"
+					}
+				]
 			}
 		}
 	},

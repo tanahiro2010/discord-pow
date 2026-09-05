@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
+import nacl from "tweetnacl";
 import worker, { NonceStore } from "../src/index";
 
 const IncomingRequest = Request<unknown, IncomingRequestCfProperties>;
@@ -14,6 +15,10 @@ class MemoryStorage {
 
   async put<T>(key: string, value: T): Promise<void> {
     this.values.set(key, value);
+  }
+
+  async delete(key: string): Promise<boolean> {
+    return this.values.delete(key);
   }
 }
 
@@ -92,6 +97,33 @@ function hasLeadingZeroBits(buf: Uint8Array, zeroBits: number): boolean {
     }
   }
   return bits <= 0;
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes)
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function signedInteractionRequest(
+  interaction: Record<string, unknown>,
+  keyPair: nacl.SignKeyPair,
+  timestamp = Math.floor(Date.now() / 1000)
+): IncomingRequest {
+  const body = JSON.stringify(interaction);
+  const signature = nacl.sign.detached(
+    new TextEncoder().encode(String(timestamp) + body),
+    keyPair.secretKey
+  );
+  return new IncomingRequest("http://example.com/interactions", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-signature-ed25519": bytesToHex(signature),
+      "x-signature-timestamp": String(timestamp),
+    },
+    body,
+  });
 }
 
 async function findPowNonce(token: string, diff: number): Promise<string> {
@@ -176,6 +208,150 @@ describe("nonce replay protection", () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+
+  it("allows a retry after a retryable role grant failure", async () => {
+    const testEnv = createTestEnv();
+    const diff = 1;
+    const now = Math.floor(Date.now() / 1000);
+    const exp = now + 600;
+    const token = await makeToken(
+      testEnv.POW_SECRET,
+      "guild",
+      "user",
+      testEnv.VERIFIED_ROLE_ID,
+      exp,
+      diff
+    );
+    const powNonce = await findPowNonce(token, diff);
+    let discordCalls = 0;
+
+    vi.stubGlobal("setTimeout", ((callback: () => void) => {
+      callback();
+      return 0;
+    }) as any);
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.startsWith("https://discord.com/api/v10/")) {
+        discordCalls += 1;
+        return new Response(null, { status: discordCalls <= 3 ? 500 : 204 });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+
+    const makeRequest = () =>
+      new IncomingRequest("http://example.com/api/submit", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token, nonce: powNonce, user_id: "user", guild_id: "guild" }),
+      });
+
+    try {
+      const firstResponse = await worker.fetch(makeRequest(), testEnv);
+      expect(firstResponse.status).toBe(503);
+
+      const secondResponse = await worker.fetch(makeRequest(), testEnv);
+      expect(secondResponse.status).toBe(200);
+      expect(discordCalls).toBe(5);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("rejects a token and nonce at their exact expiry second", async () => {
+    const testEnv = createTestEnv();
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-13T00:00:00Z"));
+
+    try {
+      const exp = Math.floor(Date.now() / 1000);
+      const token = await makeToken(
+        testEnv.POW_SECRET,
+        "guild",
+        "user",
+        testEnv.VERIFIED_ROLE_ID,
+        exp,
+        1
+      );
+      const powNonce = await findPowNonce(token, 1);
+      const request = new IncomingRequest("http://example.com/api/submit", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token, nonce: powNonce, user_id: "user", guild_id: "guild" }),
+      });
+
+      const response = await worker.fetch(request, testEnv);
+      expect(response.status).toBe(400);
+
+      const store = new NonceStore({ storage: new MemoryStorage() } as any);
+      const nonceResponse = await store.fetch(
+        new Request("https://nonce-store/mark", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ expiresAt: exp }),
+        })
+      );
+      expect(nonceResponse.status).toBe(400);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("rejects malformed, stale, and duplicate Discord interactions", async () => {
+    const keyPair = nacl.sign.keyPair();
+    const testEnv = createTestEnv({ DISCORD_PUBLIC_KEY: bytesToHex(keyPair.publicKey) });
+    const interaction = { id: "interaction-1", type: 1 };
+    const body = JSON.stringify(interaction);
+    const now = Math.floor(Date.now() / 1000);
+
+    const malformed = new IncomingRequest("http://example.com/interactions", {
+      method: "POST",
+      headers: {
+        "x-signature-ed25519": "00",
+        "x-signature-timestamp": String(now),
+      },
+      body,
+    });
+    expect((await worker.fetch(malformed, testEnv)).status).toBe(401);
+
+    const stale = signedInteractionRequest(interaction, keyPair, now - 301);
+    expect((await worker.fetch(stale, testEnv)).status).toBe(401);
+
+    const valid = signedInteractionRequest(interaction, keyPair, now);
+    expect((await worker.fetch(valid, testEnv)).status).toBe(200);
+    const duplicate = signedInteractionRequest(interaction, keyPair, now);
+    expect((await worker.fetch(duplicate, testEnv)).status).toBe(409);
+  });
+
+  it("disables pow_submit unless explicitly enabled", async () => {
+    const keyPair = nacl.sign.keyPair();
+    const testEnv = createTestEnv({ DISCORD_PUBLIC_KEY: bytesToHex(keyPair.publicKey) });
+    const request = signedInteractionRequest(
+      { id: "pow-submit-disabled", type: 2, data: { name: "pow_submit" }, guild_id: "guild", member: { user: { id: "user" } } },
+      keyPair
+    );
+
+    const response = await worker.fetch(request, testEnv);
+    expect(response.status).toBe(200);
+    expect((await response.json() as any).data.content).toBe("pow_submit is disabled.");
+  });
+
+  it("uses the configured default difficulty for mobile-origin interactions", async () => {
+    const keyPair = nacl.sign.keyPair();
+    const testEnv = createTestEnv({
+      DISCORD_PUBLIC_KEY: bytesToHex(keyPair.publicKey),
+      POW_DIFFICULTY_DEFAULT: "22",
+      POW_DIFFICULTY_MOBILE: "1",
+    });
+    const request = signedInteractionRequest(
+      { id: "mobile-difficulty", type: 2, data: { name: "pow" }, guild_id: "guild", member: { user: { id: "user" } } },
+      keyPair
+    );
+    request.headers.set("user-agent", "Discord/1.0 (Android; Mobile)");
+
+    const response = await worker.fetch(request, testEnv);
+    expect(response.status).toBe(200);
+    expect((await response.json() as any).data.content).toContain("difficulty=22");
   });
 
   it("grants the student role and the 2026 additional verified role", async () => {

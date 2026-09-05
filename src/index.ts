@@ -11,7 +11,6 @@ interface Env {
   ALLOWED_GUILD_IDS?: string;
   POW_TTL_SEC?: string;
   POW_DIFFICULTY_DEFAULT?: string;
-  POW_DIFFICULTY_MOBILE?: string;
   INTERACTIONS_RATE_LIMIT_PER_MIN?: string;
   SUBMIT_RATE_LIMIT_PER_MIN?: string;
   NONCE_STORE: DurableObjectNamespace;
@@ -26,6 +25,8 @@ const ROLE_GRANT_BASE_DELAY_MS = 200;
 const RATE_LIMIT_WINDOW_SEC = 60;
 const INTERACTIONS_RATE_LIMIT_PER_MIN_DEFAULT = 60;
 const SUBMIT_RATE_LIMIT_PER_MIN_DEFAULT = 20;
+const DISCORD_SIGNATURE_MAX_AGE_SEC = 300;
+const NONCE_CLAIM_LEASE_SEC = 30;
 const ADDITIONAL_VERIFIED_ROLE_ID_2026 = "1504117815333093426";
 const ADDITIONAL_VERIFIED_ROLE_ID_2027 = "1504117815333093426";
 const ADDITIONAL_ROLE_2027_START_MS = Date.UTC(2026, 11, 31, 15, 0, 0); // 2027-01-01 00:00 JST
@@ -33,7 +34,7 @@ const ADDITIONAL_ROLE_2027_START_MS = Date.UTC(2026, 11, 31, 15, 0, 0); // 2027-
 // -------------------- util --------------------
 function hexToU8(hex: string): Uint8Array {
   const clean = hex.startsWith("0x") ? hex.slice(2) : hex;
-  if (clean.length % 2 !== 0) throw new Error("invalid hex");
+  if (clean.length % 2 !== 0 || !/^[0-9a-f]*$/i.test(clean)) throw new Error("invalid hex");
   const out = new Uint8Array(clean.length / 2);
   for (let i = 0; i < out.length; i++) out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
   return out;
@@ -161,21 +162,12 @@ function getPowTtlSec(env: Env): number {
   return intFromEnv(env.POW_TTL_SEC, POW_TTL_SEC_DEFAULT, 60, 3600);
 }
 
-function getDifficultyForUserAgent(env: Env, userAgent: string | null): number {
-  const ua = (userAgent ?? "").toLowerCase();
-  if (
-    ua.includes("mobile") ||
-    ua.includes("android") ||
-    ua.includes("iphone") ||
-    ua.includes("ipad")
-  ) {
-    return intFromEnv(env.POW_DIFFICULTY_MOBILE, DIFFICULTY_MOBILE_DEFAULT, 1, 30);
-  }
+function getDifficulty(env: Env): number {
   return intFromEnv(env.POW_DIFFICULTY_DEFAULT, DIFFICULTY_DEFAULT, 1, 30);
 }
 
-function isEnabled(value: string | undefined): boolean {
-  if (value === undefined) return true;
+function isEnabled(value: string | undefined, defaultValue = false): boolean {
+  if (value === undefined) return defaultValue;
   const v = value.trim().toLowerCase();
   return v !== "0" && v !== "false" && v !== "off";
 }
@@ -273,11 +265,24 @@ async function verifyDiscordSig(req: Request, env: Env, bodyText: string): Promi
   const sigHex = req.headers.get("x-signature-ed25519");
   const ts = req.headers.get("x-signature-timestamp");
   if (!sigHex || !ts) return false;
+  if (!/^[0-9a-f]{128}$/i.test(sigHex)) return false;
+  if (!/^\d+$/.test(ts)) return false;
 
-  const msg = new TextEncoder().encode(ts + bodyText);
-  const sig = hexToU8(sigHex);
-  const pub = hexToU8(env.DISCORD_PUBLIC_KEY);
-  return nacl.sign.detached.verify(msg, sig, pub);
+  const timestamp = Number(ts);
+  const now = Math.floor(Date.now() / 1000);
+  if (!Number.isSafeInteger(timestamp) || Math.abs(now - timestamp) > DISCORD_SIGNATURE_MAX_AGE_SEC) {
+    return false;
+  }
+  if (!/^[0-9a-f]{64}$/i.test(env.DISCORD_PUBLIC_KEY)) return false;
+
+  try {
+    const msg = new TextEncoder().encode(ts + bodyText);
+    const sig = hexToU8(sigHex);
+    const pub = hexToU8(env.DISCORD_PUBLIC_KEY);
+    return nacl.sign.detached.verify(msg, sig, pub);
+  } catch {
+    return false;
+  }
 }
 
 // -------------------- token / pow --------------------
@@ -342,7 +347,7 @@ async function verifyTokenAndPow(
   }
 
   const now = Math.floor(Date.now() / 1000);
-  if (now > parsed.exp) {
+  if (now >= parsed.exp) {
     return { ok: false, msg: "期限切れです。Discordで /pow からやり直してください。" as const };
   }
 
@@ -384,22 +389,84 @@ async function verifyTokenAndPow(
   };
 }
 
-async function checkAndMarkNonce(
+type NonceOperationResult = { ok: true } | { ok: false; status: number; msg: string };
+
+type NonceClaimResult =
+  | { ok: true; claimId: string; nonceHash: string }
+  | { ok: false; status: number; msg: string };
+
+async function claimNonce(
   env: Env,
   tokenNonce: string,
   expiresAt: number
-): Promise<{ ok: true } | { ok: false; status: number; msg: string }> {
+): Promise<NonceClaimResult> {
   const nonceHash = await sha256Base64Url(tokenNonce);
   const id = env.NONCE_STORE.idFromName(nonceHash);
   const stub = env.NONCE_STORE.get(id);
-  const res = await stub.fetch("https://nonce-store/check", {
+  const claimId = u8ToBase64Url(crypto.getRandomValues(new Uint8Array(16)));
+  const res = await stub.fetch("https://nonce-store/claim", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ expiresAt, claimId }),
+  });
+
+  if (res.status === 409) return { ok: false, status: 409, msg: "nonce already used or processing" };
+  if (!res.ok) return { ok: false, status: res.status, msg: "nonce check failed" };
+  return { ok: true, claimId, nonceHash };
+}
+
+async function completeNonce(
+  env: Env,
+  tokenNonce: string,
+  claimId: string
+): Promise<NonceOperationResult> {
+  const nonceHash = await sha256Base64Url(tokenNonce);
+  const id = env.NONCE_STORE.idFromName(nonceHash);
+  const stub = env.NONCE_STORE.get(id);
+  const res = await stub.fetch("https://nonce-store/complete", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ claimId }),
+  });
+
+  if (!res.ok) return { ok: false, status: res.status, msg: "nonce completion failed" };
+  return { ok: true };
+}
+
+async function releaseNonce(
+  env: Env,
+  tokenNonce: string,
+  claimId: string
+): Promise<NonceOperationResult> {
+  const nonceHash = await sha256Base64Url(tokenNonce);
+  const id = env.NONCE_STORE.idFromName(nonceHash);
+  const stub = env.NONCE_STORE.get(id);
+  const res = await stub.fetch("https://nonce-store/release", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ claimId }),
+  });
+
+  if (!res.ok) return { ok: false, status: res.status, msg: "nonce release failed" };
+  return { ok: true };
+}
+
+async function markInteraction(
+  env: Env,
+  interactionId: string,
+  expiresAt: number
+): Promise<NonceOperationResult> {
+  const interactionHash = await sha256Base64Url(interactionId);
+  const id = env.NONCE_STORE.idFromName(`interaction:${interactionHash}`);
+  const stub = env.NONCE_STORE.get(id);
+  const res = await stub.fetch("https://nonce-store/mark", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ expiresAt }),
   });
 
-  if (res.status === 409) return { ok: false, status: 409, msg: "nonce already used" };
-  if (!res.ok) return { ok: false, status: res.status, msg: "nonce check failed" };
+  if (res.status === 409) return { ok: false, status: 409, msg: "interaction already processed" };
+  if (!res.ok) return { ok: false, status: res.status, msg: "interaction replay check failed" };
   return { ok: true };
 }
 
@@ -458,14 +525,18 @@ function getRoleIdsToGrant(env: Env): string[] {
 
 async function addRoleDetailed(env: Env, guildId: string, userId: string, roleId: string) {
   const url = `https://discord.com/api/v10/guilds/${guildId}/members/${userId}/roles/${roleId}`;
-  const r = await fetch(url, {
-    method: "PUT",
-    headers: { Authorization: `Bot ${env.DISCORD_BOT_TOKEN}` },
-  });
-  const retryAfterRaw = r.headers.get("retry-after");
-  const retryAfter = retryAfterRaw ? Number(retryAfterRaw) : NaN;
-  const retryAfterSec = Number.isFinite(retryAfter) ? retryAfter : undefined;
-  return { ok: r.status === 204 || r.ok, status: r.status, retryAfterSec };
+  try {
+    const r = await fetch(url, {
+      method: "PUT",
+      headers: { Authorization: `Bot ${env.DISCORD_BOT_TOKEN}` },
+    });
+    const retryAfterRaw = r.headers.get("retry-after");
+    const retryAfter = retryAfterRaw ? Number(retryAfterRaw) : NaN;
+    const retryAfterSec = Number.isFinite(retryAfter) ? retryAfter : undefined;
+    return { ok: r.status === 204 || r.ok, status: r.status, retryAfterSec };
+  } catch {
+    return { ok: false, status: 503, retryAfterSec: undefined };
+  }
 }
 
 async function addRoleWithRetry(
@@ -539,6 +610,40 @@ async function addSingleRoleWithRetry(
     attempts,
     retryable: lastRetryable,
   };
+}
+
+async function grantRolesForVerifiedToken(
+  env: Env,
+  tokenNonce: string,
+  expiresAt: number,
+  guildId: string,
+  userId: string
+): Promise<{ ok: true } | { ok: false; status: number; msg: string }> {
+  const claim = await claimNonce(env, tokenNonce, expiresAt);
+  if (!claim.ok) return claim;
+
+  const roleResult = await addRoleWithRetry(env, guildId, userId, claim.nonceHash);
+  if (!roleResult.ok) {
+    const released = await releaseNonce(env, tokenNonce, claim.claimId);
+    if (!released.ok) {
+      console.error(
+        JSON.stringify({
+          event: "nonce_release_failed",
+          nonce_hash: claim.nonceHash,
+          status: released.status,
+        })
+      );
+    }
+    return {
+      ok: false,
+      status: roleResult.retryable ? 503 : 500,
+      msg: "failed to add role",
+    };
+  }
+
+  const completed = await completeNonce(env, tokenNonce, claim.claimId);
+  if (!completed.ok) return { ok: false, status: 500, msg: "failed to finalize nonce" };
+  return { ok: true };
 }
 
 // -------------------- verify page --------------------
@@ -674,16 +779,31 @@ startBtn.onclick = async () => {
         detailEl.textContent += "nonce found: " + msg.nonce + "\\n送信中…\\n";
         setStatus("検証中…", "muted");
 
-        const r = await fetch("/api/submit", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            token: token.trim(),
-            nonce: String(msg.nonce).trim(),
-            user_id: submitUserId,
-            guild_id: submitGuildId,
-          })
-        });
+        let r;
+        try {
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 10000);
+          try {
+            r = await fetch("/api/submit", {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify({
+                token: token.trim(),
+                nonce: String(msg.nonce).trim(),
+                user_id: submitUserId,
+                guild_id: submitGuildId,
+              }),
+              signal: controller.signal,
+            });
+          } finally {
+            clearTimeout(timeoutId);
+          }
+        } catch (error) {
+          setStatus("通信に失敗しました。もう一度お試しください。", "ng");
+          detailEl.textContent += "network error: " + String(error) + "\\n";
+          startBtn.disabled = false;
+          return;
+        }
 
         const j = await r.json().catch(() => null);
         if (!r.ok || !j || !j.ok) {
@@ -771,15 +891,32 @@ export default {
       const okSig = await verifyDiscordSig(req, env, bodyText);
       if (!okSig) return new Response("invalid signature", { status: 401 });
 
-      const interaction = JSON.parse(bodyText);
-      const difficulty = getDifficultyForUserAgent(env, req.headers.get("user-agent"));
+      let interaction: any;
+      try {
+        interaction = JSON.parse(bodyText);
+      } catch {
+        return new Response("invalid JSON", { status: 400 });
+      }
+
+      const interactionId = String(interaction?.id ?? "").trim();
+      if (!interactionId) return new Response("invalid interaction", { status: 400 });
+      const interactionCheck = await markInteraction(
+        env,
+        interactionId,
+        Math.floor(Date.now() / 1000) + DISCORD_SIGNATURE_MAX_AGE_SEC
+      );
+      if (!interactionCheck.ok) {
+        return new Response(interactionCheck.msg, { status: interactionCheck.status });
+      }
+
+      const difficulty = getDifficulty(env);
 
       // PING
       if (interaction.type === 1) return json({ type: 1 });
 
       // Message Component (button)
       if (interaction.type === 3) {
-        if (!isEnabled(env.ENABLE_VERIFY_BUTTON)) {
+        if (!isEnabled(env.ENABLE_VERIFY_BUTTON, true)) {
           return json(ephemeral("現在この認証ボタンは無効です。"));
         }
 
@@ -836,13 +973,14 @@ export default {
           const v = await verifyTokenAndPow(env, token, nonce, { userId, guildId });
           if (!v.ok) return json(ephemeral(v.msg));
 
-          const nonceCheck = await checkAndMarkNonce(env, v.tokenNonce, v.expiresAt);
-          if (!nonceCheck.ok) return json(ephemeral(nonceCheck.msg));
-          const nonceHash = await sha256Base64Url(v.tokenNonce);
-          const res = await addRoleWithRetry(env, v.guildId, v.userId, nonceHash);
-          if (!res.ok) {
-            return json(ephemeral("Failed to add role. status=" + res.status));
-          }
+          const res = await grantRolesForVerifiedToken(
+            env,
+            v.tokenNonce,
+            v.expiresAt,
+            v.guildId,
+            v.userId
+          );
+          if (!res.ok) return json(ephemeral("Failed to add role. status=" + res.status));
           return json(ephemeral("Role granted."));
         }
 
@@ -900,12 +1038,15 @@ export default {
         return json({ ok: false, error: "guild not allowed" }, 403);
       }
 
-      const nonceCheck = await checkAndMarkNonce(env, v.tokenNonce, v.expiresAt);
-      if (!nonceCheck.ok) return json({ ok: false, error: nonceCheck.msg }, nonceCheck.status);
-      const nonceHash = await sha256Base64Url(v.tokenNonce);
-      const res = await addRoleWithRetry(env, v.guildId, v.userId, nonceHash);
+      const res = await grantRolesForVerifiedToken(
+        env,
+        v.tokenNonce,
+        v.expiresAt,
+        v.guildId,
+        v.userId
+      );
       if (!res.ok) {
-        return json({ ok: false, error: "failed to add role", status: res.status }, 500);
+        return json({ ok: false, error: res.msg, status: res.status }, res.status);
       }
 
       return json({ ok: true });
@@ -937,25 +1078,128 @@ export class NonceStore {
       return this.handleRateLimit(body);
     }
 
-    if (url.pathname !== "/check") {
-      return new Response("not found", { status: 404 });
+    if (url.pathname === "/claim") {
+      return this.handleClaim(body);
+    }
+    if (url.pathname === "/complete") {
+      return this.handleComplete(body);
+    }
+    if (url.pathname === "/release") {
+      return this.handleRelease(body);
+    }
+    if (url.pathname === "/mark" || url.pathname === "/check") {
+      // /check remains supported for older Worker revisions during rollout.
+      if (url.pathname === "/check" && body?.claimId) return this.handleClaim(body);
+      return this.handleMark(body);
     }
 
+    return new Response("not found", { status: 404 });
+  }
+
+  private async withConcurrencyLock<T>(callback: () => Promise<T>): Promise<T> {
+    const state = this.state as DurableObjectState & {
+      blockConcurrencyWhile?: <R>(callback: () => Promise<R>) => Promise<R>;
+    };
+    if (typeof state.blockConcurrencyWhile === "function") {
+      return state.blockConcurrencyWhile(callback);
+    }
+    return callback();
+  }
+
+  private async handleClaim(body: any): Promise<Response> {
+    const expiresAt = Number(body?.expiresAt ?? 0);
+    const claimId = String(body?.claimId ?? "");
+    if (!Number.isFinite(expiresAt) || expiresAt <= 0 || !claimId) {
+      return new Response("invalid claim", { status: 400 });
+    }
+
+    return this.withConcurrencyLock(async () => {
+      const now = Math.floor(Date.now() / 1000);
+      if (now >= expiresAt) return new Response("expired", { status: 400 });
+
+      const existing = await this.state.storage.get<any>("used");
+      if (existing && Number(existing.expiresAt ?? 0) > now) {
+        const processing = existing.status === "processing";
+        const leaseUntil = Number(existing.leaseUntil ?? 0);
+        if (!processing || !Number.isFinite(leaseUntil) || leaseUntil > now) {
+          return new Response("used", { status: 409 });
+        }
+      }
+
+      await this.state.storage.put("used", {
+        status: "processing",
+        claimId,
+        claimedAt: now,
+        leaseUntil: Math.min(expiresAt, now + NONCE_CLAIM_LEASE_SEC),
+        expiresAt,
+      });
+      return new Response("ok");
+    });
+  }
+
+  private async handleComplete(body: any): Promise<Response> {
+    const claimId = String(body?.claimId ?? "");
+    if (!claimId) return new Response("invalid claim", { status: 400 });
+
+    return this.withConcurrencyLock(async () => {
+      const now = Math.floor(Date.now() / 1000);
+      const existing = await this.state.storage.get<any>("used");
+      if (existing?.status === "used" && Number(existing.expiresAt ?? 0) > now) {
+        return new Response("ok");
+      }
+      if (!existing || existing.status !== "processing" || existing.claimId !== claimId) {
+        return new Response("claim mismatch", { status: 409 });
+      }
+      if (now >= Number(existing.expiresAt ?? 0)) {
+        return new Response("expired", { status: 400 });
+      }
+      if (Number(existing.leaseUntil ?? 0) <= now) {
+        return new Response("claim expired", { status: 409 });
+      }
+
+      await this.state.storage.put("used", {
+        status: "used",
+        usedAt: now,
+        expiresAt: existing.expiresAt,
+      });
+      return new Response("ok");
+    });
+  }
+
+  private async handleRelease(body: any): Promise<Response> {
+    const claimId = String(body?.claimId ?? "");
+    if (!claimId) return new Response("invalid claim", { status: 400 });
+
+    return this.withConcurrencyLock(async () => {
+      const existing = await this.state.storage.get<any>("used");
+      if (!existing) return new Response("ok");
+      if (existing.status !== "processing" || existing.claimId !== claimId) {
+        return new Response("claim mismatch", { status: 409 });
+      }
+
+      await this.state.storage.delete("used");
+      return new Response("ok");
+    });
+  }
+
+  private async handleMark(body: any): Promise<Response> {
     const expiresAt = Number(body?.expiresAt ?? 0);
     if (!Number.isFinite(expiresAt) || expiresAt <= 0) {
       return new Response("invalid expiresAt", { status: 400 });
     }
 
-    const now = Math.floor(Date.now() / 1000);
-    if (now > expiresAt) return new Response("expired", { status: 400 });
+    return this.withConcurrencyLock(async () => {
+      const now = Math.floor(Date.now() / 1000);
+      if (now >= expiresAt) return new Response("expired", { status: 400 });
 
-    const existing = await this.state.storage.get<{ expiresAt?: number }>("used");
-    if (existing && Number(existing.expiresAt ?? 0) > now) {
-      return new Response("used", { status: 409 });
-    }
+      const existing = await this.state.storage.get<any>("used");
+      if (existing && Number(existing.expiresAt ?? 0) > now) {
+        return new Response("used", { status: 409 });
+      }
 
-    await this.state.storage.put("used", { usedAt: now, expiresAt });
-    return new Response("ok");
+      await this.state.storage.put("used", { status: "used", usedAt: now, expiresAt });
+      return new Response("ok");
+    });
   }
 
   private async handleRateLimit(body: any): Promise<Response> {
