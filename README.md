@@ -105,13 +105,13 @@ npm run deploy:v2
 - リプレイ対策: token内のnonceはワンタイム（TTL内でも再利用不可）
 - 防げること: token改ざん、別ユーザー/ギルド/ロールへの転用、単純な連打の抑止
 - 防げないこと: GPU/分散での高速解、アカウント共有・代理解、PoWの完全迂回
-- difficulty目安: まずはPC=20、スマホ=16あたりから開始し、体感時間に合わせて調整
+- difficulty目安: 端末に依存しない既定値20から開始し、体感時間に合わせて調整
 - レート制限推奨: `/interactions` と `/api/submit` にWAF/Rate Limitを適用
 
 ## 設定
 - `src/index.ts`:
   - `POW_TTL_SEC` トークンの有効期限（秒、未指定時 600）
-  - `POW_DIFFICULTY_DEFAULT` / `POW_DIFFICULTY_MOBILE` PoW 難易度（先頭 0 ビット数、未指定時 20 / 16）
+  - `POW_DIFFICULTY_DEFAULT` PoW 難易度（先頭 0 ビット数、未指定時 20）
   - `ALLOWED_GUILD_IDS` 許可するGuild IDのカンマ区切り。未指定時は制限なし
   - `INTERACTIONS_RATE_LIMIT_PER_MIN` `/interactions` のIP単位レート制限。未指定時 60/min、0で無効
   - `SUBMIT_RATE_LIMIT_PER_MIN` `/api/submit` のIP単位レート制限。未指定時 20/min、0で無効
@@ -131,7 +131,8 @@ npm run deploy:v2
 
 ## 防御実装メモ
 - `/interactions` と `/api/submit` は `NONCE_STORE` Durable Object を使って固定窓のレート制限を行います
-- token nonce は `NONCE_STORE` に保存され、期限内の再利用は `409` で拒否されます
+- token nonce は `NONCE_STORE` で処理中・完了を管理し、ロール付与に失敗した場合は再試行できます。完了済みの期限内再利用は `409` で拒否されます
+- Discord Interaction は署名の形式・時刻を検証し、Interaction ID の期限内重複を `409` で拒否します
 - `ALLOWED_GUILD_IDS` を設定すると、想定外Guildからの発行・提出を拒否できます
 - レスポンスには `no-store`, `no-referrer`, `nosniff`, `Permissions-Policy`, `COOP`, `CORP` を付与しています
 
